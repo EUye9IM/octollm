@@ -392,11 +392,20 @@ func (e *ChatCompletionToClaudeMessages) convertStreamResponse(req *octollm.Requ
 	inCh := src.Chan()
 	outCh := make(chan *octollm.StreamChunk)
 	ctx, cancel := context.WithCancel(req.Context())
+	// Closing the converted stream cancels ctx and closes the source: pending
+	// sends and receives both select on ctx, so neither keeps this goroutine
+	// parked, even if the source producer is slow to close its channel.
+	newStream := octollm.NewStreamChan(outCh, func() {
+		cancel()
+		src.Close()
+	})
 
 	intPtr := func(i int) *int { return &i }
 
 	octollm.SafeGo(req, func() {
-		defer close(outCh)
+		// Runs last on every exit, including the early return after [DONE]:
+		// the source's terminal error is published before outCh closes.
+		defer octollm.FinishStream(newStream, outCh, src)
 		defer src.Close()
 		defer cancel()
 
@@ -419,8 +428,9 @@ func (e *ChatCompletionToClaudeMessages) convertStreamResponse(req *octollm.Requ
 		var pendingFinishReason *string
 		var pendingUsage *openai.Usage
 
-		for chunk := range inCh {
-			if ctx.Err() != nil {
+		for {
+			chunk, ok := octollm.RecvChunk(ctx, inCh)
+			if !ok {
 				break
 			}
 
@@ -743,7 +753,6 @@ func (e *ChatCompletionToClaudeMessages) convertStreamResponse(req *octollm.Requ
 		}
 	})
 
-	newStream := octollm.NewStreamChan(outCh, cancel)
 	return newStream, nil
 }
 

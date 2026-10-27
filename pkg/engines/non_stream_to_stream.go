@@ -111,10 +111,27 @@ func (e *NonStreamToStreamEngine) Process(req *octollm.Request) (*octollm.Respon
 	}
 	defer resp.Stream.Close()
 
+	// Closing the stream on any return (deferred above) also releases the
+	// producer when merging fails early.
 	for chunk := range resp.Stream.Chan() {
 		if err := merger.Merge(chunk); err != nil {
 			return nil, fmt.Errorf("merge stream chunk: %w", err)
 		}
+	}
+	// A producer that abandoned the stream publishes why before closing it.
+	// The partial result must not become a successful response.
+	if err := resp.Stream.Err(); err != nil {
+		return nil, err
+	}
+	// Wrappers between the producer and here propagate the error only when
+	// they finish; one that exits early (e.g. on cancellation) may close
+	// before it saw the error. The attempt's abort mark is set before the
+	// failed stream ends, so it is the authoritative fallback.
+	if state := streamReq.CurrentAttempt(); state != nil && state.Aborted() {
+		if err := state.AbortError(); err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("stream attempt aborted")
 	}
 	body, err := merger.Merged()
 	if err != nil {

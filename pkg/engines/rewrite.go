@@ -162,9 +162,25 @@ func (e *RewriteEngine) Process(req *octollm.Request) (*octollm.Response, error)
 		rewritenChunk := make(chan *octollm.StreamChunk)
 		originalStream := resp.Stream
 		ctx, cancel := context.WithCancel(req.Context())
+		newStream := octollm.NewStreamChan(rewritenChunk, func() {
+			originalStream.Close()
+			cancel()
+		})
 		octollm.SafeGo(req, func() {
-			defer close(rewritenChunk)
-			for chunk := range originalStream.Chan() {
+			// Propagate the source's terminal error on every exit path.
+			defer octollm.FinishStream(newStream, rewritenChunk, originalStream)
+			for {
+				var chunk *octollm.StreamChunk
+				var ok bool
+				select {
+				case chunk, ok = <-originalStream.Chan():
+				case <-ctx.Done():
+					slog.DebugContext(ctx, "stream chunk rewrite context canceled")
+					return
+				}
+				if !ok {
+					return
+				}
 				b, err := chunk.Body.Bytes()
 				if err != nil {
 					slog.WarnContext(ctx, fmt.Sprintf("read stream chunk error: %s", err))
@@ -180,10 +196,7 @@ func (e *RewriteEngine) Process(req *octollm.Request) (*octollm.Response, error)
 			}
 		})
 		slog.DebugContext(req.Context(), "[RewriteEngine.Run] stream chunk rewritten")
-		resp.Stream = octollm.NewStreamChan(rewritenChunk, func() {
-			originalStream.Close()
-			cancel()
-		})
+		resp.Stream = newStream
 	} else {
 		if e.NonstreamResponseRewrite == nil {
 			return resp, nil

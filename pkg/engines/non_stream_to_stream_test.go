@@ -2,8 +2,10 @@ package engines
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/tidwall/gjson"
 
@@ -173,5 +175,70 @@ func TestNonStreamToStream_AllowlistBypass(t *testing.T) {
 	}
 	if resp.Stream != nil {
 		t.Error("response should pass through unchanged")
+	}
+}
+
+func TestNonStreamToStream_TerminalErrorFailsMerge(t *testing.T) {
+	terminal := errors.New("terminal")
+	next := octollm.EngineFunc(func(req *octollm.Request) (*octollm.Response, error) {
+		resp := streamFromChunks(`{"id":"c","model":"m","choices":[{"index":0,"delta":{"content":"partial"}}]}`)
+		resp.Stream.SetError(terminal)
+		return resp, nil
+	})
+	resp, err := NewNonStreamToStreamEngine(next).Process(chatReq(context.Background()))
+	if !errors.Is(err, terminal) {
+		t.Fatalf("err = %v, want terminal error", err)
+	}
+	if resp != nil {
+		t.Fatal("partial result must be discarded")
+	}
+}
+
+func TestRewriteEngine_StreamChunkRewritePropagatesError(t *testing.T) {
+	terminal := errors.New("terminal")
+	next := octollm.EngineFunc(func(req *octollm.Request) (*octollm.Response, error) {
+		resp := streamFromChunks(`{"id":"c","choices":[]}`)
+		resp.Stream.SetError(terminal)
+		return resp, nil
+	})
+	eng := NewRewriteEngine(next, nil, nil, &RewritePolicy{SetKeys: map[string]any{"x": 1}})
+	resp, err := eng.Process(chatReq(context.Background()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for range resp.Stream.Chan() {
+		n++
+	}
+	if n != 1 {
+		t.Fatalf("chunks = %d, want 1", n)
+	}
+	if !errors.Is(resp.Stream.Err(), terminal) {
+		t.Fatalf("Err = %v, want terminal", resp.Stream.Err())
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if !resp.Stream.WaitDone(ctx) {
+		t.Fatal("rewrite stream must report completion")
+	}
+}
+
+// A wrapper that closed early without propagating the error must not turn an
+// aborted attempt into a successful merge.
+func TestNonStreamToStream_AbortedAttemptFailsMerge(t *testing.T) {
+	abortErr := errors.New("aborted upstream")
+	next := octollm.EngineFunc(func(req *octollm.Request) (*octollm.Response, error) {
+		req.CurrentAttempt().Abort(abortErr)
+		// The stream itself ends without an error, as after an early exit.
+		return streamFromChunks(`{"id":"c","model":"m","choices":[{"index":0,"delta":{"content":"partial"}}]}`), nil
+	})
+	attemptReq, scope := chatReq(context.Background()).BeginAttempt("svc")
+	defer scope.Cancel()
+	resp, err := NewNonStreamToStreamEngine(next).Process(attemptReq)
+	if !errors.Is(err, abortErr) {
+		t.Fatalf("err = %v, want abort error", err)
+	}
+	if resp != nil {
+		t.Fatal("partial result must be discarded")
 	}
 }
