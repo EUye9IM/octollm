@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,6 +22,8 @@ import (
 // nil affinityProvider skips that path and tests fallback selection only (weighted round-robin).
 
 type stubEngine struct {
+	// mu guards the call bookkeeping: some tests call one stub concurrently.
+	mu           sync.Mutex
 	resp         *octollm.Response
 	err          error
 	callCount    int
@@ -29,6 +32,8 @@ type stubEngine struct {
 }
 
 func (s *stubEngine) Process(req *octollm.Request) (*octollm.Response, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.callCount++
 	s.lastCalledTs = time.Now()
 	if req != nil {
