@@ -65,7 +65,8 @@ func NewTrafficReplicationEngine(targets []TrafficReplicationTarget, next octoll
 // ctx wraps the source request's context: [IsDuplicateRequest] is set to true, parent cancellation
 // is not propagated ([context.WithoutCancel]), and a deadline is applied using expiration (or
 // [DefaultReplicationExpiration] if expiration <= 0). Other context values inherited from the
-// source remain visible to [context.Context.Value] unless shadowed.
+// source remain visible to [context.Context.Value] unless shadowed; the source's current attempt is
+// shadowed ([octollm.WithoutAttempt]).
 //
 // The returned cancel must be called when the clone is no longer needed (e.g. defer cancel() in
 // the goroutine that processes the clone) to release the deadline timer.
@@ -77,6 +78,9 @@ func CloneForReplication(req *octollm.Request, expiration time.Duration) (clone 
 		expiration = DefaultReplicationExpiration
 	}
 	ctx := context.WithValue(req.Context(), IsDuplicateRequest, true)
+	// The clone is a separate logical request: it must not observe (or write
+	// into) the source's current attempt.
+	ctx = octollm.WithoutAttempt(ctx)
 	ctx = context.WithoutCancel(ctx)
 	ctx, cancel = context.WithDeadline(ctx, time.Now().Add(expiration))
 

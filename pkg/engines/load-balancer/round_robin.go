@@ -53,8 +53,20 @@ const (
 	backendName loadBalancerMetadataKey = "backend_name"
 )
 
-// GetSelectedBackendName retrieves the selected backend name from request metadata.
+// GetSelectedBackendName returns the backend of the attempt the request is
+// observing: inside an attempt its own backend, outside one (on a request
+// whose load balancer uses attempts) the backend of the selected attempt.
+// Load balancers that do not use attempts keep the legacy metadata value.
 func GetSelectedBackendName(req *octollm.Request) (string, bool) {
+	if req == nil {
+		return "", false
+	}
+	if state, ok := req.ObservedAttempt(); ok {
+		if state == nil {
+			return "", false
+		}
+		return state.BackendName(), true
+	}
 	val, ok := req.GetMetadataValue(backendName)
 	if !ok {
 		return "", false

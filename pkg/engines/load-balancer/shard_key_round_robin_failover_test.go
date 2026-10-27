@@ -65,7 +65,7 @@ func rejectUnlessStrong(e *captureHitKindEngine) octollm.Engine {
 func TestShardKeyWRR_HitKindAndLimiterFailover(t *testing.T) {
 	selectedBackend := func(t *testing.T, req *octollm.Request) string {
 		t.Helper()
-		mv, ok := req.GetMetadataValue(backendName)
+		mv, ok := selectedBackendMeta(req)
 		require.True(t, ok)
 		name, ok := mv.(string)
 		require.True(t, ok)
@@ -281,7 +281,7 @@ func TestShardKeyWRR_PLoadFailover(t *testing.T) {
 	}
 	selectedBackend := func(t *testing.T, req *octollm.Request) string {
 		t.Helper()
-		mv, ok := req.GetMetadataValue(backendName)
+		mv, ok := selectedBackendMeta(req)
 		require.True(t, ok)
 		name, ok := mv.(string)
 		require.True(t, ok)

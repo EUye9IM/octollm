@@ -205,6 +205,11 @@ func (l *ShardKeyConcurrency) Process(req *octollm.Request) (*octollm.Response, 
 
 	modelName, _ := octollm.GetCtxValue[string](req, octollm.ContextKeyModelName)
 
+	// This call's result starts with no selected attempt: a return without any
+	// attempt (no candidate, all skipped) must not expose a previous load
+	// balancer's attempt on the same logical request.
+	req.SelectAttempt(nil)
+
 	prioritized, commitAffinity, err := l.resolveAffinity(req)
 	if err != nil {
 		return nil, err
@@ -220,7 +225,30 @@ func (l *ShardKeyConcurrency) Process(req *octollm.Request) (*octollm.Response, 
 	var lastRealErr error
 	var lastN string
 	var lastActualKind common.CacheHitKind
+	// lastRealState is the attempt paired with lastRealErr; it is published
+	// together with the error so outer observers read the attempt whose
+	// result is actually returned.
+	var lastRealState *octollm.AttemptState
+	returnLast := func() (*octollm.Response, error) {
+		if lastRealState != nil {
+			req.SelectAttempt(lastRealState)
+		}
+		return lastRealResp, lastRealErr
+	}
+	// cancelBeforeAttempt keeps a previous call's error (and its attempt);
+	// without one it returns the cancellation and publishes no attempt.
+	cancelBeforeAttempt := func(ctxErr error) (*octollm.Response, error) {
+		slog.WarnContext(req.Context(), fmt.Sprintf("[ShardKey Concurrency load balancer] request context error before attempt: %v", ctxErr))
+		if lastRealErr != nil {
+			return returnLast()
+		}
+		return nil, ctxErr
+	}
 	for {
+		// Do not start (another) attempt once the user has gone away.
+		if err := req.Context().Err(); err != nil {
+			return cancelBeforeAttempt(err)
+		}
 		var n string
 		var eng octollm.Engine
 		var actualKind common.CacheHitKind
@@ -265,7 +293,7 @@ func (l *ShardKeyConcurrency) Process(req *octollm.Request) (*octollm.Response, 
 					cacheAwareRouteCounter.WithLabelValues(string(expectKind), string(lastActualKind), modelName, lastN).Inc()
 				}
 				if lastRealErr != nil {
-					return lastRealResp, lastRealErr
+					return returnLast()
 				}
 				return nil, fmt.Errorf("no backend engine available")
 			}
@@ -279,6 +307,11 @@ func (l *ShardKeyConcurrency) Process(req *octollm.Request) (*octollm.Response, 
 		}
 
 		var admissionDone AttemptDoneFunc
+		// Selection may have taken a while; re-check before admission, which
+		// may reserve a probe slot.
+		if err := req.Context().Err(); err != nil {
+			return cancelBeforeAttempt(err)
+		}
 		if l.backendAdmission != nil {
 			var allowed bool
 			admissionDone, allowed = l.backendAdmission.BeforeAttempt(req, n)
@@ -292,9 +325,25 @@ func (l *ShardKeyConcurrency) Process(req *octollm.Request) (*octollm.Response, 
 			}
 		}
 
-		attemptReq := req.WithContext(context.WithValue(req.Context(), common.ContextKeyCacheHitKind, actualKind))
-		attemptReq.SetMetadataValue(backendName, n)
+		// Admission may have taken a while too: never start the svc call
+		// after the user has gone away. Like a canceled call, this records
+		// no admission outcome.
+		if err := req.Context().Err(); err != nil {
+			return cancelBeforeAttempt(err)
+		}
+
+		// Each attempt gets its own state and cancelable context; the backend
+		// name is fixed when the attempt is created.
+		attemptReq, scope := req.WithContext(context.WithValue(req.Context(), common.ContextKeyCacheHitKind, actualKind)).BeginAttempt(n)
 		resp, err := eng.Process(attemptReq)
+		if err == nil {
+			// A stream is still produced after Process returns: keep the
+			// attempt alive until the response is closed.
+			scope.BindResponseLifetime(resp)
+			req.SelectAttempt(scope.State())
+		} else {
+			scope.FinishFailed(resp)
+		}
 		if admissionDone != nil {
 			if err == nil {
 				admissionDone(true)
@@ -318,6 +367,7 @@ func (l *ShardKeyConcurrency) Process(req *octollm.Request) (*octollm.Response, 
 		if isNotRetriableError(err) {
 			slog.WarnContext(req.Context(), fmt.Sprintf("[ShardKey Concurrency load balancer] error is not retriable, return without retry: %v", err))
 			cacheAwareRouteCounter.WithLabelValues(string(expectKind), string(actualKind), modelName, n).Inc()
+			req.SelectAttempt(scope.State())
 			return resp, err
 		}
 
@@ -327,11 +377,16 @@ func (l *ShardKeyConcurrency) Process(req *octollm.Request) (*octollm.Response, 
 				slog.String("backend_name", n),
 			)
 			// When lastRealErr is nil, lastRealResp must also be nil: the response is written only in the non-rate-limit error branch, paired with the error.
+			// A local reject never replaces a real call's error (nor its
+			// attempt); it is paired with its own attempt only when it is the
+			// only error so far.
 			if lastRealErr == nil {
 				lastRealErr = err
+				lastRealState = scope.State()
 			}
 		} else {
 			lastRealResp, lastRealErr = resp, err
+			lastRealState = scope.State()
 			lastN, lastActualKind = n, actualKind
 			retryCount++
 		}
@@ -339,23 +394,23 @@ func (l *ShardKeyConcurrency) Process(req *octollm.Request) (*octollm.Response, 
 		if req.Context().Err() != nil {
 			slog.WarnContext(req.Context(), fmt.Sprintf("[ShardKey Concurrency load balancer] request context error: %v", req.Context().Err()))
 			cacheAwareRouteCounter.WithLabelValues(string(expectKind), string(actualKind), modelName, n).Inc()
-			return lastRealResp, lastRealErr
+			return returnLast()
 		}
 		if time.Since(start) >= l.retryTimeout {
 			slog.WarnContext(req.Context(), fmt.Sprintf("[ShardKey Concurrency load balancer] retry period %v reached, return last resp and err", l.retryTimeout))
 			cacheAwareRouteCounter.WithLabelValues(string(expectKind), string(actualKind), modelName, n).Inc()
-			return lastRealResp, lastRealErr
+			return returnLast()
 		}
 		if retryCount >= l.retryMaxCount {
 			slog.WarnContext(req.Context(), fmt.Sprintf("[ShardKey Concurrency load balancer] retry max count %d reached, return last resp and err", l.retryMaxCount))
 			cacheAwareRouteCounter.WithLabelValues(string(expectKind), string(actualKind), modelName, n).Inc()
-			return lastRealResp, lastRealErr
+			return returnLast()
 		}
 		if len(excludeNames) >= len(l.backends) {
 			slog.WarnContext(req.Context(), "[ShardKey Concurrency load balancer] all backends have been tried, return last resp and err")
 			cacheAwareRouteCounter.WithLabelValues(string(expectKind), string(actualKind), modelName, n).Inc()
 			if lastRealErr != nil {
-				return lastRealResp, lastRealErr
+				return returnLast()
 			}
 			return nil, fmt.Errorf("no backend engine available")
 		}

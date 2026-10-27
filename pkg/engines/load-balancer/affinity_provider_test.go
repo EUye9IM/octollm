@@ -520,7 +520,7 @@ func TestShardKeyConcurrency_WithAffinityProvider(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 
-	mv, ok := req.GetMetadataValue(backendName)
+	mv, ok := selectedBackendMeta(req)
 	require.True(t, ok)
 	assert.Equal(t, "hot", mv.(string))
 
