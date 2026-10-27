@@ -243,8 +243,9 @@ func (e *ClaudeMockEndpoint) claudeStreamResponse(req *octollm.Request, v *anthr
 
 	msgID := "msg_mock-id"
 
+	streamChan := octollm.NewStreamChan(ch, cancel)
 	octollm.SafeGo(req, func() {
-		defer close(ch)
+		defer octollm.FinishStream(streamChan, ch, nil)
 
 		startEvent := &anthropic.ClaudeMessagesStreamEvent{
 			Type: "message_start",
@@ -358,7 +359,6 @@ func (e *ClaudeMockEndpoint) claudeStreamResponse(req *octollm.Request, v *anthr
 		}
 	})
 
-	streamChan := octollm.NewStreamChan(ch, cancel)
 	hdr := http.Header{
 		"Content-Type":  {"text/event-stream"},
 		"X-Mock-Params": {p.String()},

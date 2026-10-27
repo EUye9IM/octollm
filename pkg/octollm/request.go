@@ -225,9 +225,41 @@ type Response struct {
 	Stream     *StreamChan
 }
 
+// StreamChan is a stream of chunks produced by one goroutine (the producer)
+// and read by one consumer.
+//
+// Besides the chunk channel it carries three pieces of lifecycle state:
+//
+//   - a terminal error ([StreamChan.SetError] / [StreamChan.Err]). A producer
+//     that gives up on the stream publishes why before closing the output
+//     channel, so a consumer that has drained the channel can tell a clean end
+//     from an aborted one. A nil Err after the channel is closed means a
+//     normal end.
+//   - a stop request ([StreamChan.Close] / [StreamChan.Closed]). Close asks the
+//     producer to stop and releases what the stream owns. It never closes the
+//     output channel (that belongs to the producer) and never sets an error.
+//   - a completion signal ([StreamChan.MarkDone] / [StreamChan.Done]). The
+//     producer reports, after its resources are released and its synchronous
+//     bookkeeping has run, that it has finished. Asynchronous work it spawned
+//     (log upload, reports) is not covered.
+//
+// Ordering contract for producers: SetError (if any) → close(output channel)
+// → MarkDone. A Close that happened earlier proves none of these.
+//
+// Producers created before MarkDone existed may never call it; every wait on
+// Done must therefore be bounded (see [StreamChan.WaitDone]).
 type StreamChan struct {
-	ch        <-chan *StreamChunk
-	closeFunc func()
+	ch <-chan *StreamChunk
+
+	mu         sync.Mutex
+	closeFuncs []func()
+	closed     bool
+	closedCh   chan struct{}
+
+	err error
+
+	doneOnce sync.Once
+	doneCh   chan struct{}
 }
 
 type StreamChunk struct {
@@ -235,20 +267,176 @@ type StreamChunk struct {
 	Body     *UnifiedBody
 }
 
+// NewStreamChan wraps ch. closeFunc (optional) runs once, on the first Close.
 func NewStreamChan(ch <-chan *StreamChunk, closeFunc func()) *StreamChan {
-	return &StreamChan{
-		ch:        ch,
-		closeFunc: closeFunc,
+	sc := &StreamChan{
+		ch:       ch,
+		closedCh: make(chan struct{}),
+		doneCh:   make(chan struct{}),
 	}
+	if closeFunc != nil {
+		sc.closeFuncs = append(sc.closeFuncs, closeFunc)
+	}
+	return sc
 }
 
 func (sc *StreamChan) Chan() <-chan *StreamChunk {
 	return sc.ch
 }
 
+// Close requests the producer to stop and releases the resources owned by the
+// stream. It is idempotent: the registered close callbacks run exactly once,
+// in registration order, on the first call. Close does not close the output
+// channel and does not set a terminal error.
 func (sc *StreamChan) Close() {
-	if sc.closeFunc != nil {
-		sc.closeFunc()
+	if sc == nil {
+		return
+	}
+	sc.mu.Lock()
+	if sc.closed {
+		sc.mu.Unlock()
+		return
+	}
+	sc.closed = true
+	funcs := sc.closeFuncs
+	sc.closeFuncs = nil
+	if sc.closedCh != nil {
+		close(sc.closedCh)
+	}
+	sc.mu.Unlock()
+
+	for _, f := range funcs {
+		f()
+	}
+}
+
+// Closed is closed once Close has been called. Producers select on it so that
+// sends and receives stop waiting when the consumer has asked them to stop.
+func (sc *StreamChan) Closed() <-chan struct{} {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if sc.closedCh == nil {
+		sc.closedCh = make(chan struct{})
+		if sc.closed {
+			close(sc.closedCh)
+		}
+	}
+	return sc.closedCh
+}
+
+// OnClose registers closeFunc to run on Close. Callbacks run once, in
+// registration order. Registering on an already closed stream runs closeFunc
+// immediately, so a late registration still releases its resource exactly once.
+func (sc *StreamChan) OnClose(closeFunc func()) {
+	if closeFunc == nil {
+		return
+	}
+	sc.mu.Lock()
+	if sc.closed {
+		sc.mu.Unlock()
+		closeFunc()
+		return
+	}
+	sc.closeFuncs = append(sc.closeFuncs, closeFunc)
+	sc.mu.Unlock()
+}
+
+// SetError publishes the stream's terminal error. nil is ignored and only the
+// first non-nil error is kept. Producers must call it before closing the
+// output channel. Safe for concurrent use.
+func (sc *StreamChan) SetError(err error) {
+	if sc == nil || err == nil {
+		return
+	}
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if sc.err == nil {
+		sc.err = err
+	}
+}
+
+// Err returns the terminal error published by the producer. Once the output
+// channel is closed it is final; nil means the stream ended normally.
+func (sc *StreamChan) Err() error {
+	if sc == nil {
+		return nil
+	}
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	return sc.err
+}
+
+func (sc *StreamChan) doneChan() chan struct{} {
+	sc.doneOnce.Do(func() {
+		if sc.doneCh == nil {
+			sc.doneCh = make(chan struct{})
+		}
+	})
+	return sc.doneCh
+}
+
+// MarkDone is called by the producer after it has released its resources and
+// finished its synchronous end-of-stream work (after closing the output
+// channel). Idempotent.
+func (sc *StreamChan) MarkDone() {
+	if sc == nil {
+		return
+	}
+	ch := sc.doneChan()
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	select {
+	case <-ch:
+	default:
+		close(ch)
+	}
+}
+
+// Done is closed when the producer has called MarkDone. It differs both from
+// Closed (a stop request) and from the output channel being closed (no more
+// data). Producers that predate MarkDone never close it, so waits must be
+// bounded.
+func (sc *StreamChan) Done() <-chan struct{} {
+	return sc.doneChan()
+}
+
+// WaitDone waits until the producer reports completion or ctx is done, and
+// reports whether the producer completed. ctx should carry a deadline.
+func (sc *StreamChan) WaitDone(ctx context.Context) bool {
+	if sc == nil {
+		return true
+	}
+	select {
+	case <-sc.Done():
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// FinishStream ends a wrapping producer's output in contract order: it
+// publishes src's terminal error (if any) on out, closes ch (out's output
+// channel), then marks out done. src may be nil.
+//
+// Call it exactly once, after the wrapper's own synchronous bookkeeping, and
+// in place of a bare close(ch).
+func FinishStream(out *StreamChan, ch chan<- *StreamChunk, src *StreamChan) {
+	if src != nil {
+		out.SetError(src.Err())
+	}
+	close(ch)
+	out.MarkDone()
+}
+
+// RecvChunk receives the next chunk from ch unless ctx is done first. ok is
+// false when ch is closed or ctx is done. Wrapping producers use it so a stop
+// request releases a receive as well as a send.
+func RecvChunk(ctx context.Context, ch <-chan *StreamChunk) (*StreamChunk, bool) {
+	select {
+	case chunk, ok := <-ch:
+		return chunk, ok
+	case <-ctx.Done():
+		return nil, false
 	}
 }
 
@@ -257,6 +445,10 @@ func (sc *StreamChan) Close() {
 // window after the terminal chunk is not going to, and the end-of-stream
 // bookkeeping it would run is not worth stalling the client's response.
 const DefaultDrainTimeout = time.Second
+
+// DefaultStreamDoneTimeout bounds how long a caller waits for a producer to
+// report completion after the stream was closed (see [StreamChan.WaitDone]).
+const DefaultStreamDoneTimeout = time.Second
 
 // DrainRemaining discards every chunk left on the stream until the producer
 // closes the channel or ctx is done, whichever comes first. The chunks are
@@ -302,18 +494,6 @@ func (sc *StreamChan) DrainRemaining(ctx context.Context) {
 		case <-ctx.Done():
 			slog.DebugContext(ctx, "[stream] drain aborted before upstream closed", "err", ctx.Err())
 			return
-		}
-	}
-}
-
-func (sc *StreamChan) OnClose(closeFunc func()) {
-	if sc.closeFunc == nil {
-		sc.closeFunc = closeFunc
-	} else {
-		prevClose := sc.closeFunc
-		sc.closeFunc = func() {
-			prevClose()
-			closeFunc()
 		}
 	}
 }

@@ -243,8 +243,9 @@ func (e *MockEndpoint) openAIStreamResponse(req *octollm.Request, v *openai.Chat
 	ch := make(chan *octollm.StreamChunk)
 	ctx, cancel := context.WithCancel(req.Context())
 
+	streamChan := octollm.NewStreamChan(ch, cancel)
 	octollm.SafeGo(req, func() {
-		defer close(ch)
+		defer octollm.FinishStream(streamChan, ch, nil)
 		time.Sleep(p.ttft)
 		for _, c := range p.outputRunes {
 			bodyVal := &openai.ChatCompletionStreamChunk{
@@ -305,7 +306,6 @@ func (e *MockEndpoint) openAIStreamResponse(req *octollm.Request, v *openai.Chat
 		}
 	})
 
-	streamChan := octollm.NewStreamChan(ch, cancel)
 	hdr := http.Header{
 		"Content-Type":  {"text/event-stream"},
 		"X-Mock-Params": {p.String()},
