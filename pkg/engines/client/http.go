@@ -64,9 +64,18 @@ func truncateIncomingRespDumpForDebugLog(dump []byte) string {
 	return string(dump[:maxIncomingRespDumpDebugLogBytes]) + " ... [truncated, total=" + strconv.Itoa(len(dump)) + " bytes]"
 }
 
+// GetClientRecvFirstChunkTime returns when the first upstream chunk arrived.
+//
+// Inside an attempt it reads the current attempt; outside one, on a request
+// whose load balancer uses attempts, it reads the selected attempt. In both
+// cases a missing value is reported as such, never taken from stale shared
+// metadata. Requests without attempts keep the legacy metadata behavior.
 func GetClientRecvFirstChunkTime(req *octollm.Request) (time.Time, bool) {
 	if req == nil {
 		return time.Time{}, false
+	}
+	if state, ok := req.ObservedAttempt(); ok {
+		return state.FirstChunkTime()
 	}
 	value, ok := req.GetMetadataValue(clientRecvFirstChunkTime)
 	if !ok {
@@ -76,9 +85,15 @@ func GetClientRecvFirstChunkTime(req *octollm.Request) (time.Time, bool) {
 	return t, ok
 }
 
+// GetClientProcessStreamError returns the transport-level stream error, read
+// with the same attempt rules as GetClientRecvFirstChunkTime. It is separate
+// from an attempt's abort error.
 func GetClientProcessStreamError(req *octollm.Request) (error, bool) {
 	if req == nil {
 		return nil, false
+	}
+	if state, ok := req.ObservedAttempt(); ok {
+		return state.StreamError()
 	}
 	value, ok := req.GetMetadataValue(clientProcessStreamError)
 	if !ok {
@@ -86,6 +101,46 @@ func GetClientProcessStreamError(req *octollm.Request) (error, bool) {
 	}
 	err, ok := value.(error)
 	return err, ok
+}
+
+func recordFirstChunkTime(req *octollm.Request, t time.Time) {
+	if state := req.CurrentAttempt(); state != nil {
+		state.RecordFirstChunkTime(t)
+		return
+	}
+	req.SetMetadataValue(clientRecvFirstChunkTime, t)
+}
+
+// errStreamClosedByConsumer is the cancel cause of a transport stopped by
+// StreamChan.Close. The read error such a deliberate teardown causes is not a
+// stream failure and is not recorded.
+var errStreamClosedByConsumer = errors.New("stream closed by consumer")
+
+// closedByConsumer reports whether ctx (the transport context) was canceled by
+// the stream's Close rather than by the request.
+func closedByConsumer(ctx context.Context) bool {
+	return errors.Is(context.Cause(ctx), errStreamClosedByConsumer)
+}
+
+func recordStreamError(req *octollm.Request, err error) {
+	if state := req.CurrentAttempt(); state != nil {
+		state.RecordStreamError(err)
+		return
+	}
+	req.SetMetadataValue(clientProcessStreamError, err)
+}
+
+// cancelOnCloseBody cancels the transport context once the response body is
+// closed, so a fully read or abandoned body also releases the HTTP request.
+type cancelOnCloseBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *cancelOnCloseBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.cancel()
+	return err
 }
 
 type HTTPEndpoint struct {
@@ -147,8 +202,21 @@ func (e *HTTPEndpoint) Process(req *octollm.Request) (*octollm.Response, error) 
 	if err != nil {
 		return nil, fmt.Errorf("get request body reader error: %w", err)
 	}
+
+	// The transport lifetime is its own cancelable context: closing the
+	// returned stream (or body) must cancel the real HTTP request, which is
+	// what unblocks a producer parked in a body read.
+	transportCtx, cancelTransportCause := context.WithCancelCause(req.Context())
+	cancelTransport := func() { cancelTransportCause(nil) }
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			cancelTransport()
+		}
+	}()
+
 	httpReq, err := http.NewRequestWithContext(
-		req.Context(),
+		transportCtx,
 		http.MethodPost,
 		url,
 		bytes.NewReader(bodyBytes))
@@ -235,33 +303,52 @@ func (e *HTTPEndpoint) Process(req *octollm.Request) (*octollm.Response, error) 
 	if !isStream {
 		// non-stream
 		slog.DebugContext(req.Context(), "[http-endpoint] returning non-stream response")
-		body := octollm.NewBodyFromReader(resp.Body, e.nonstreamParser(req))
+		// The body stays readable until it is fully read or closed; either
+		// releases the transport context.
+		body := octollm.NewBodyFromReader(&cancelOnCloseBody{ReadCloser: resp.Body, cancel: cancelTransport}, e.nonstreamParser(req))
 		llmresp := octollm.NewNonStreamResponse(resp.StatusCode, resp.Header, body)
+		handedOff = true
 		return llmresp, nil
 	}
 
 	// stream response
-	ch := make(chan *octollm.StreamChunk)
-	ctx, cancel := context.WithCancel(req.Context())
-	streamChan := octollm.NewStreamChan(ch, cancel)
-	llmresp := octollm.NewStreamResponse(resp.StatusCode, resp.Header, streamChan)
-
-	// use a scanner to read SSE messages
 	streamParser, streamingType := e.streamParser(req)
+	if streamingType != StreamingTypeSSE && streamingType != StreamingTypeJSON {
+		resp.Body.Close()
+		return nil, fmt.Errorf("unsupported streaming type %s", streamingType)
+	}
+
+	ch := make(chan *octollm.StreamChunk)
+	streamChan := octollm.NewStreamChan(ch, func() { cancelTransportCause(errStreamClosedByConsumer) })
+	llmresp := octollm.NewStreamResponse(resp.StatusCode, resp.Header, streamChan)
+	ctx := transportCtx
+
+	// The producers close the body and then ch themselves; finish releases
+	// the transport context and only then reports completion.
+	finish := func() {
+		cancelTransport()
+		streamChan.MarkDone()
+	}
+	handedOff = true
 	switch streamingType {
 	case StreamingTypeSSE:
-		octollm.SafeGo(req, func() { e.processSSEStream(ctx, req, resp, ch, streamParser) })
+		octollm.SafeGo(req, func() {
+			defer finish()
+			e.processSSEStream(ctx, req, resp, ch, streamParser)
+		})
 	case StreamingTypeJSON:
-		octollm.SafeGo(req, func() { e.processJSONStream(ctx, req, resp, ch, streamParser) })
-	default:
-		cancel() // just for the linter
-		return nil, fmt.Errorf("unsupported streaming type %s", streamingType)
+		octollm.SafeGo(req, func() {
+			defer finish()
+			e.processJSONStream(ctx, req, resp, ch, streamParser)
+		})
 	}
 
 	slog.DebugContext(req.Context(), "[http-endpoint] returning stream response")
 	return llmresp, nil
 }
 
+// processSSEStream reads SSE events into ch, then closes the body and ch.
+// The caller reports completion once it returns.
 func (e *HTTPEndpoint) processSSEStream(ctx context.Context, req *octollm.Request, resp *http.Response, ch chan *octollm.StreamChunk, streamParser octollm.Parser) {
 	defer close(ch)
 	defer resp.Body.Close()
@@ -321,7 +408,7 @@ func (e *HTTPEndpoint) processSSEStream(ctx context.Context, req *octollm.Reques
 		case "data":
 			if recvFirstChunkTime.IsZero() {
 				recvFirstChunkTime = time.Now()
-				req.SetMetadataValue(clientRecvFirstChunkTime, recvFirstChunkTime)
+				recordFirstChunkTime(req, recvFirstChunkTime)
 			}
 			// find the first non-space byte
 			start := slices.IndexFunc(line[colonIdx+1:], func(b byte) bool {
@@ -339,13 +426,20 @@ func (e *HTTPEndpoint) processSSEStream(ctx context.Context, req *octollm.Reques
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		req.SetMetadataValue(clientProcessStreamError, fmt.Errorf("%w: %w", ErrStreamScan, err))
+		if closedByConsumer(ctx) {
+			// Deliberate teardown (e.g. after [DONE] or an abort): not a failure.
+			slog.DebugContext(ctx, fmt.Sprintf("[http-endpoint] stream read stopped by consumer close: %v, total chunks sent: %d", err, totalChunkSent))
+			return
+		}
+		recordStreamError(req, fmt.Errorf("%w: %w", ErrStreamScan, err))
 		slog.WarnContext(ctx, fmt.Sprintf("[http-endpoint] scan response body error: %v, total chunks sent: %d", err, totalChunkSent))
 	} else {
 		slog.InfoContext(ctx, fmt.Sprintf("[http-endpoint] stream ended: normal completion, total chunks sent: %d", totalChunkSent))
 	}
 }
 
+// processJSONStream reads a JSON array stream into ch, with the same resource
+// contract as processSSEStream.
 func (e *HTTPEndpoint) processJSONStream(ctx context.Context, req *octollm.Request, resp *http.Response, ch chan *octollm.StreamChunk, streamParser octollm.Parser) {
 	defer close(ch)
 	defer resp.Body.Close()
@@ -382,7 +476,7 @@ func (e *HTTPEndpoint) processJSONStream(ctx context.Context, req *octollm.Reque
 
 		if recvFirstChunkTime.IsZero() {
 			recvFirstChunkTime = time.Now()
-			req.SetMetadataValue(clientRecvFirstChunkTime, recvFirstChunkTime)
+			recordFirstChunkTime(req, recvFirstChunkTime)
 		}
 
 		// Create chunk from raw JSON bytes
@@ -402,7 +496,11 @@ func (e *HTTPEndpoint) processJSONStream(ctx context.Context, req *octollm.Reque
 	// Read closing bracket ']'
 	_, err = dec.Token()
 	if err != nil {
-		req.SetMetadataValue(clientProcessStreamError, err)
+		if closedByConsumer(ctx) {
+			slog.DebugContext(ctx, fmt.Sprintf("[http-endpoint] JSON stream read stopped by consumer close: %v", err))
+			return
+		}
+		recordStreamError(req, err)
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			slog.InfoContext(ctx, fmt.Sprintf("[http-endpoint] stream ended: context cancelled: %v, total chunks sent: %d", err, totalChunkSent))
 		} else {
